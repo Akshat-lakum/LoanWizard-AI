@@ -1,0 +1,34 @@
+# LoanWizard AI — Backend Dependencies
+# Compatible with Python 3.12 - 3.14
+# Last updated: April 2026
+
+# ── Web Framework ──
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.18
+websockets>=14.0
+
+# ── Speech-to-Text ──
+# Using faster-whisper instead of openai-whisper
+# (faster, lighter, works with Python 3.14, no numba dependency)
+faster-whisper>=1.1.0
+
+# ── Face Analysis ──
+mediapipe>=0.10.21
+opencv-python-headless>=4.11.0
+
+# ── NLP / Entity Extraction ──
+spacy>=3.8.0
+
+# ── LLM Integration ──
+google-genai>=1.0.0
+anthropic>=0.42.0
+
+# ── Core ──
+pydantic>=2.10.0
+numpy>=2.1.0
+Pillow>=11.0.0
+aiofiles>=24.1.0
+
+# ── Audio Processing ──
+soundfile>=0.13.0
