@@ -11,10 +11,17 @@ import asyncio
 import base64
 from typing import Optional, Dict, List
 from datetime import datetime
+from pathlib import Path
+
+# Load .env file BEFORE anything else reads env vars
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+
+from pydantic import BaseModel
 
 from models import (
     SessionCreate, Session, SessionStatus, STTResult,
@@ -114,7 +121,7 @@ async def create_session(data: SessionCreate):
     session = Session(
         customer_name=data.customer_name,
         phone=data.phone,
-        source_campaign=data.source_campaign,
+        source_campaign=data.source_campaign or "direct",
     )
     audit_logger.create_session(session)
     get_session_state(session.session_id)
@@ -188,114 +195,120 @@ async def extract_entities_endpoint(
 
 # ─── Face Analysis ───────────────────────────────────────────
 
-@app.post("/api/face/analyze")
-async def analyze_face_endpoint(
-    session_id: str,
-    frame_base64: str,
-    declared_age: Optional[int] = None,
-):
-    """Analyze a video frame for face detection, age, and liveness."""
-    result = await analyze_face(frame_base64, session_id, declared_age)
-    audit_logger.log_face_analysis(session_id, result)
+class FaceAnalyzeRequest(BaseModel):
+    session_id: str
+    frame_base64: str
+    declared_age: Optional[int] = None
 
+@app.post("/api/face/analyze")
+async def analyze_face_endpoint(req: FaceAnalyzeRequest):
+    """Analyze a video frame for face detection, age, and liveness."""
+    result = await analyze_face(req.frame_base64, req.session_id, req.declared_age)
+    audit_logger.log_face_analysis(req.session_id, result)
     return result.model_dump()
 
 
+class QuickFaceRequest(BaseModel):
+    frame_base64: str
+
 @app.post("/api/face/quick")
-async def quick_face_check(frame_base64: str):
+async def quick_face_check(req: QuickFaceRequest):
     """Quick face detection — for real-time UI feedback."""
-    return await analyze_frame_quick(frame_base64)
+    return await analyze_frame_quick(req.frame_base64)
 
 
 # ─── Geo-location ───────────────────────────────────────────
 
+class GeoVerifyRequest(BaseModel):
+    session_id: str
+    location: GeoLocation
+
 @app.post("/api/geo/verify")
-async def verify_geo(session_id: str, location: GeoLocation):
+async def verify_geo(req: GeoVerifyRequest):
     """Verify customer's geo-location."""
-    # Simple verification logic
     verification = GeoVerification(
-        location=location,
-        is_within_serviceable_area=location.country in [None, "India", "IN"],
+        location=req.location,
+        is_within_serviceable_area=req.location.country in [None, "India", "IN"],
         location_mismatch_flag=False,
         vpn_detected=False,
     )
 
-    state = get_session_state(session_id)
+    state = get_session_state(req.session_id)
     entities = state["entities"]
 
-    # Check if declared city matches geo city
-    if entities.city and location.city:
+    if entities.city and req.location.city:
         declared = entities.city.lower()
-        geo = location.city.lower()
+        geo = req.location.city.lower()
         if declared != geo and declared not in geo and geo not in declared:
             verification.location_mismatch_flag = True
 
-    audit_logger.log_geo_verification(session_id, verification)
-
+    audit_logger.log_geo_verification(req.session_id, verification)
     return verification.model_dump()
 
 
 # ─── Consent Capture ─────────────────────────────────────────
 
+class ConsentCaptureRequest(BaseModel):
+    session_id: str
+    consent_type: str
+    verbal_response: str
+
 @app.post("/api/consent/capture")
-async def capture_consent(
-    session_id: str,
-    consent_type: str,
-    verbal_response: str,
-):
+async def capture_consent(req: ConsentCaptureRequest):
     """Capture and verify customer consent."""
-    granted = await verify_consent(verbal_response)
+    granted = await verify_consent(req.verbal_response)
 
     consent = ConsentRecord(
-        consent_type=ConsentType(consent_type),
+        consent_type=ConsentType(req.consent_type),
         granted=granted,
-        verbal_confirmation=verbal_response,
+        verbal_confirmation=req.verbal_response,
     )
 
-    audit_logger.log_consent(session_id, consent)
+    audit_logger.log_consent(req.session_id, consent)
 
-    state = get_session_state(session_id)
+    state = get_session_state(req.session_id)
     state["consents"].append(consent)
 
     return {
-        "consent_type": consent_type,
+        "consent_type": req.consent_type,
         "granted": granted,
-        "verbal_response": verbal_response,
+        "verbal_response": req.verbal_response,
     }
 
 
 # ─── LLM Agent Response ─────────────────────────────────────
 
+class AgentRespondRequest(BaseModel):
+    session_id: str
+    customer_message: str
+    language: str = "en"
+
 @app.post("/api/agent/respond")
-async def agent_respond(
-    session_id: str,
-    customer_message: str,
-    language: str = "en",
-):
+async def agent_respond(req: AgentRespondRequest):
     """
     Generate the AI agent's next response.
     This is the core conversation engine endpoint.
     """
-    state = get_session_state(session_id)
+    state = get_session_state(req.session_id)
 
     # First, extract entities from what the customer said
-    state["entities"] = await extract_entities(customer_message, state["entities"])
+    state["entities"] = await extract_entities(req.customer_message, state["entities"])
 
     # Generate agent response
     response = await generate_agent_response(
-        transcript=customer_message,
+        transcript=req.customer_message,
         entities=state["entities"],
         conversation_history=state["conversation"],
-        language=language,
+        language=req.language,
     )
 
     # Update conversation history
-    state["conversation"].append({"role": "user", "content": customer_message})
+    state["conversation"].append({"role": "user", "content": req.customer_message})
     state["conversation"].append({"role": "assistant", "content": response})
 
     # Log
-    audit_logger.log_event(session_id, "agent_responded", {
-        "customer_said": customer_message,
+    audit_logger.log_event(req.session_id, "agent_responded", {
+        "customer_said": req.customer_message,
         "agent_said": response,
     })
 
@@ -308,26 +321,24 @@ async def agent_respond(
 
 # ─── Risk & Offer ───────────────────────────────────────────
 
+class SessionRequest(BaseModel):
+    session_id: str
+
 @app.post("/api/risk/assess")
-async def assess_risk_endpoint(session_id: str):
+async def assess_risk_endpoint(req: SessionRequest):
     """Run full risk assessment for the session."""
-    state = get_session_state(session_id)
-    app_data = audit_logger.get_application(session_id)
+    state = get_session_state(req.session_id)
+    app_data = audit_logger.get_application(req.session_id)
 
-    # Get face analysis (latest)
     face_result = app_data.face_analysis if app_data else FaceAnalysisResult()
-
-    # Get geo verification
     geo_result = app_data.geo_verification if app_data else GeoVerification(
         location=GeoLocation(latitude=0, longitude=0)
     )
 
-    # Analyze conversation for fraud signals
     fraud_flags = await analyze_conversation_for_fraud(
         state["conversation"], state["entities"]
     )
 
-    # Run risk assessment
     assessment = await assess_risk(
         entities=state["entities"],
         face_result=face_result,
@@ -336,18 +347,16 @@ async def assess_risk_endpoint(session_id: str):
         fraud_flags=fraud_flags,
     )
 
-    audit_logger.log_risk_assessment(session_id, assessment)
-
+    audit_logger.log_risk_assessment(req.session_id, assessment)
     return assessment.model_dump()
 
 
 @app.post("/api/offer/generate")
-async def generate_offer_endpoint(session_id: str):
+async def generate_offer_endpoint(req: SessionRequest):
     """Generate personalized loan offer."""
-    state = get_session_state(session_id)
-    app_data = audit_logger.get_application(session_id)
+    state = get_session_state(req.session_id)
+    app_data = audit_logger.get_application(req.session_id)
 
-    # First run risk assessment
     face_result = app_data.face_analysis if app_data else FaceAnalysisResult()
     geo_result = app_data.geo_verification if app_data else GeoVerification(
         location=GeoLocation(latitude=0, longitude=0)
@@ -360,11 +369,10 @@ async def generate_offer_endpoint(session_id: str):
         state["consents"], fraud_flags
     )
 
-    # Generate offer
     offer = await generate_offer(state["entities"], risk)
 
-    audit_logger.log_risk_assessment(session_id, risk)
-    audit_logger.log_offer_generated(session_id, offer)
+    audit_logger.log_risk_assessment(req.session_id, risk)
+    audit_logger.log_offer_generated(req.session_id, offer)
 
     state["status"] = SessionStatus.OFFER_GENERATED
 
