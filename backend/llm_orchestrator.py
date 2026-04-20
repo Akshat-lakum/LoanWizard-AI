@@ -9,6 +9,8 @@ import json
 import logging
 from typing import Optional, List, Dict
 from models import ExtractedEntities, LoanPurpose, SessionStatus
+from dotenv import load_dotenv
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +41,10 @@ def _get_client():
         except ImportError:
             # Try older SDK format
             try:
-                import google.generativeai as genai
-                genai.configure(api_key=GEMINI_API_KEY)
-                _client = genai
-                _provider = "gemini_legacy"
-                logger.info("Using Google Gemini API (legacy SDK).")
+                from google import genai as google_genai
+                _client = google_genai.Client(api_key=GEMINI_API_KEY)
+                _provider = "gemini"
+                logger.info("Using Google Gemini API.")
                 return _client, _provider
             except Exception as e:
                 logger.warning(f"Gemini init failed: {e}")

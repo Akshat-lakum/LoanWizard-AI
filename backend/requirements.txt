@@ -14,7 +14,7 @@ websockets>=14.0
 faster-whisper>=1.1.0
 
 # ── Face Analysis ──
-mediapipe>=0.10.21
+pip install mediapipe==0.10.9
 opencv-python-headless>=4.11.0
 
 # ── NLP / Entity Extraction ──

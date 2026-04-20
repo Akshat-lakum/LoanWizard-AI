@@ -11,6 +11,7 @@ import logging
 import base64
 from typing import Optional, Tuple, List
 from models import FaceAnalysisResult
+import mediapipe as mp   
 
 logger = logging.getLogger(__name__)
 
@@ -19,30 +20,37 @@ logger = logging.getLogger(__name__)
 _face_mesh = None
 _face_detection = None
 
-
 def _init_mediapipe():
-    """Initialize MediaPipe models on first use."""
+    """Initialize MediaPipe models using new Tasks API (0.10.x+)."""
     global _face_mesh, _face_detection
     if _face_mesh is not None:
         return
-
     try:
         import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
 
-        _face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
+        # New Tasks API — FaceLandmarker replaces FaceMesh
+        face_mesh_options = mp_vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=None),
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            running_mode=mp_vision.RunningMode.IMAGE
+        )
+        _face_mesh = mp_vision.FaceLandmarker.create_from_options(face_mesh_options)
+
+        face_det_options = mp_vision.FaceDetectorOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=None),
             min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            running_mode=mp_vision.RunningMode.IMAGE
         )
+        _face_detection = mp_vision.FaceDetector.create_from_options(face_det_options)
 
-        _face_detection = mp.solutions.face_detection.FaceDetection(
-            model_selection=1,          # Full-range model (works at distance)
-            min_detection_confidence=0.5
-        )
-
-        logger.info("MediaPipe Face Mesh + Detection initialized.")
+        logger.info("MediaPipe FaceLandmarker + FaceDetector initialized (Tasks API).")
     except Exception as e:
         logger.error(f"Failed to init MediaPipe: {e}")
 
@@ -77,7 +85,7 @@ class FaceTracker:
             curr_nose = landmarks[1]
             movement = np.linalg.norm(curr_nose - prev_nose)
             # Exponential moving average
-            self.head_movement_score = 0.9 * self.head_movement_score + 0.1 * movement
+            self.head_movement_score = float(0.9 * self.head_movement_score + 0.1 * movement)
 
     def _compute_ear(self, landmarks: np.ndarray) -> float:
         """
@@ -105,9 +113,9 @@ class FaceTracker:
                 return 0.3
 
             ear = (vertical1 + vertical2) / (2.0 * horizontal)
-            return ear
+            return float(ear)
         except (IndexError, ValueError):
-            return 0.3
+            return float(0.3)
 
     def get_liveness_score(self) -> float:
         """
@@ -161,7 +169,7 @@ class FaceTracker:
             diff = abs(sig_first - sig_last)
 
             # If ratio changes by more than 20%, likely a different person
-            return diff < 0.2
+            return bool(diff < 0.2)
         except (IndexError, ValueError):
             return True
 
@@ -314,16 +322,14 @@ async def analyze_face(
         if _face_mesh is None:
             return FaceAnalysisResult(face_detected=False)
 
-        results = _face_mesh.process(rgb_frame)
-
-        if not results.multi_face_landmarks:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        results = _face_mesh.detect(mp_image)
+        if not results.face_landmarks:
             return FaceAnalysisResult(face_detected=False)
-
-        # Extract landmarks as numpy array
-        face_landmarks = results.multi_face_landmarks[0]
+        face_landmarks = results.face_landmarks[0]
         landmarks = np.array(
-            [(lm.x, lm.y, lm.z) for lm in face_landmarks.landmark]
-        )
+            [(lm.x, lm.y, lm.z) for lm in face_landmarks]
+)
 
         # Update face tracker
         tracker = get_tracker(session_id)
@@ -385,18 +391,20 @@ async def analyze_frame_quick(frame_base64: str) -> dict:
         if _face_detection is None:
             return {"face_detected": False}
 
-        results = _face_detection.process(rgb)
-
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = _face_detection.detect(mp_image)
         if results.detections:
             detection = results.detections[0]
+            bbox = detection.bounding_box
+            h, w = frame.shape[:2]
             return {
                 "face_detected": True,
-                "confidence": detection.score[0],
+                "confidence": detection.categories[0].score,
                 "bbox": {
-                    "x": detection.location_data.relative_bounding_box.xmin,
-                    "y": detection.location_data.relative_bounding_box.ymin,
-                    "w": detection.location_data.relative_bounding_box.width,
-                    "h": detection.location_data.relative_bounding_box.height,
+                    "x": bbox.origin_x / w,
+                    "y": bbox.origin_y / h,
+                    "w": bbox.width / w,
+                    "h": bbox.height / h,
                 }
             }
         return {"face_detected": False}
